@@ -140,8 +140,6 @@ def canny_edge_detection(image, sigma, threshold_low, threshold_high):
 def draw_edges_on_image(image, edges):
 
     output = image.copy()
-
-    # Detected edge pixels become black.
     output[edges > 0] = [0, 0, 0]
 
     return output
@@ -191,8 +189,8 @@ def process_image(path, sigma, threshold_low, threshold_high):
 
 # Main program
 params = {
-    "butterfly.png":    (1.0, 20, 35),
-    "paithaniEdge.png": (1.3, 10, 25),
+    "butterfly.png":    (1.2, 5, 30),
+    "paithaniEdge.png": (1.3, 5, 25),
     "rangoli.png":      (1.2, 5, 12)
 }
 
