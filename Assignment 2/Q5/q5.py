@@ -1,16 +1,9 @@
-
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 
 
-# ============================================================
-# 1. Manual foreground selection
-# ============================================================
-
 def select_foreground(image, title):
-    """Interactively select the foreground with a polygon."""
-
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.imshow(image, cmap="gray" if image.ndim == 2 else None)
     ax.set_title(title + "\nLeft click: add point | Right click: finish")
@@ -23,7 +16,6 @@ def select_foreground(image, title):
 
         if event.button == 1 and event.xdata is not None and event.ydata is not None:
             points.append((event.xdata, event.ydata))
-
             ax.plot(event.xdata, event.ydata, "ro", markersize=4)
 
             if len(points) > 1:
@@ -54,25 +46,12 @@ def select_foreground(image, title):
 
     h, w = image.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
-
     coordinates = np.column_stack((xx.ravel(), yy.ravel()))
-    foreground_mask = Path(points).contains_points(coordinates).reshape(h, w)
 
-    return foreground_mask
+    return Path(points).contains_points(coordinates).reshape(h, w)
 
-
-# ============================================================
-# 2. Exact Euclidean distance transform (NumPy only)
-# ============================================================
 
 def distance_transform(binary):
-    """
-    Exact Euclidean distance to the nearest True pixel.
-
-    Uses the Felzenszwalb-Huttenlocher 1-D squared-distance
-    transform, applied once to rows and once to columns.
-    """
-
     h, w = binary.shape
     INF = 1e12
     f = np.where(binary, 0.0, INF)
@@ -92,7 +71,9 @@ def distance_transform(binary):
         for q in range(1, n):
             while True:
                 vk = v[k]
-                s = ((f[q] + q * q) - (f[vk] + vk * vk)) / (2.0 * q - 2.0 * vk)
+                s = ((f[q] + q * q) - (f[vk] + vk * vk)) / (
+                    2.0 * q - 2.0 * vk
+                )
 
                 if s <= z[k]:
                     k -= 1
@@ -119,26 +100,19 @@ def distance_transform(binary):
         return d
 
     tmp = np.empty_like(f)
+
     for y in range(h):
         tmp[y] = dt_1d(f[y])
 
     out = np.empty_like(f)
+
     for x in range(w):
         out[:, x] = dt_1d(tmp[:, x])
 
     return np.sqrt(out)
 
 
-# ============================================================
-# 3. Circular disc row spans
-# ============================================================
-
 def disc_row_spans(radius):
-    """
-    For each vertical offset dy, return the maximum horizontal
-    offset dx belonging to the circular disc.
-    """
-
     r = int(radius)
     spans = []
 
@@ -149,17 +123,7 @@ def disc_row_spans(radius):
     return spans
 
 
-# ============================================================
-# 4. Integral image
-# ============================================================
-
 def integral_image(image):
-    """
-    2-D summed-area table.
-
-    The returned array has one extra row and column of zeros.
-    """
-
     if image.ndim == 2:
         image = image[..., None]
 
@@ -175,12 +139,6 @@ def integral_image(image):
 
 
 def rectangle_sum(integral, y1, y2, x1, x2):
-    """
-    Vectorized inclusive rectangle sum.
-
-    All coordinates are clipped to the image.
-    """
-
     h = integral.shape[0] - 1
     w = integral.shape[1] - 1
 
@@ -197,25 +155,12 @@ def rectangle_sum(integral, y1, y2, x1, x2):
     )
 
 
-# ============================================================
-# 5. Disc sum for all pixels
-# ============================================================
-
 def disc_sum_all_pixels(integral, radius):
-    """
-    Exact disc sum using horizontal disc spans and one integral
-    image.
-
-    This avoids looping over every pixel inside the disc.
-    Complexity: O(H * W * radius).
-    """
-
     h = integral.shape[0] - 1
     w = integral.shape[1] - 1
     c = integral.shape[2]
 
     result = np.zeros((h, w, c), dtype=np.float64)
-
     x = np.arange(w)
 
     for dy, dx in disc_row_spans(radius):
@@ -244,23 +189,11 @@ def disc_sum_all_pixels(integral, radius):
     return result
 
 
-# ============================================================
-# 6. Disc sum only at selected pixels
-# ============================================================
-
 def disc_sum_at_pixels(integral, ys, xs, radius):
-    """
-    Exact disc sum only at the requested pixels.
-
-    Used for boundary pixels, so we avoid processing the entire
-    image unnecessarily.
-    """
-
     c = integral.shape[2]
     result = np.zeros((len(ys), c), dtype=np.float64)
 
     for dy, dx in disc_row_spans(radius):
-
         y = ys + dy
 
         valid = (y >= 0) & (y < integral.shape[0] - 1)
@@ -286,27 +219,7 @@ def disc_sum_at_pixels(integral, ys, xs, radius):
     return result
 
 
-# ============================================================
-# 7. Optimized boundary-aware Bokeh
-# ============================================================
-
 def bokeh_background(image, foreground_mask, diameter):
-    """
-    Blur only the background with a uniform circular disc.
-
-    Interior pixels:
-        The disc is completely inside the background and image,
-        so a fixed normalization (disc area) is used.
-
-    Boundary pixels:
-        The disc is cropped by the image and/or foreground.
-        A background-only integral image gives the cropped sum
-        and cropped number of valid pixels, so the filter is
-        correctly renormalized.
-
-    Foreground pixels are left unchanged.
-    """
-
     image = np.asarray(image, dtype=np.float64)
 
     if image.ndim == 2:
@@ -320,10 +233,6 @@ def bokeh_background(image, foreground_mask, diameter):
     radius = int(diameter // 2)
 
     background = ~foreground_mask
-
-    # --------------------------------------------------------
-    # Identify pixels for which the complete disc is valid.
-    # --------------------------------------------------------
 
     dist_fg = distance_transform(foreground_mask)
 
@@ -342,12 +251,7 @@ def bokeh_background(image, foreground_mask, diameter):
     )
 
     boundary = background & ~interior
-
     output = img.copy()
-
-    # --------------------------------------------------------
-    # Background-only image and mask.
-    # --------------------------------------------------------
 
     bg_img = img * background[..., None]
     bg_count = background.astype(np.float64)[..., None]
@@ -355,31 +259,14 @@ def bokeh_background(image, foreground_mask, diameter):
     integral_img = integral_image(bg_img)
     integral_count = integral_image(bg_count)
 
-    # --------------------------------------------------------
-    # INTERIOR
-    #
-    # Full disc is valid. We can use a fixed denominator.
-    # --------------------------------------------------------
-
     disc_area = sum(
         2 * dx + 1
         for _, dx in disc_row_spans(radius)
     )
 
     if np.any(interior):
-        # Calculate disc sums only once for the image.
         disc_sums = disc_sum_all_pixels(integral_img, radius)
-
-        output[interior] = (
-            disc_sums[interior] / disc_area
-        )
-
-    # --------------------------------------------------------
-    # BOUNDARY
-    #
-    # Only boundary pixels are handled here.
-    # The integral image makes each horizontal disc span O(1).
-    # --------------------------------------------------------
+        output[interior] = disc_sums[interior] / disc_area
 
     if np.any(boundary):
         ys, xs = np.nonzero(boundary)
@@ -399,7 +286,6 @@ def bokeh_background(image, foreground_mask, diameter):
         )[:, 0]
 
         valid = counts > 0
-
         output[ys[valid], xs[valid]] = (
             sums[valid] / counts[valid, None]
         )
@@ -410,10 +296,6 @@ def bokeh_background(image, foreground_mask, diameter):
     return output
 
 
-# ============================================================
-# 8. Display
-# ============================================================
-
 def display_results(original, result50, result100, title):
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
@@ -421,24 +303,28 @@ def display_results(original, result50, result100, title):
         axes[0].imshow(np.clip(original, 0, 1))
         axes[1].imshow(np.clip(result50, 0, 1))
         axes[2].imshow(np.clip(result100, 0, 1))
-
     else:
         vmin = np.min(original)
         vmax = np.max(original)
 
-        im0 = axes[0].imshow(
-            original, cmap="gray", vmin=vmin, vmax=vmax
+        axes[0].imshow(
+            original,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax
         )
-        im1 = axes[1].imshow(
-            result50, cmap="gray", vmin=vmin, vmax=vmax
+        axes[1].imshow(
+            result50,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax
         )
-        im2 = axes[2].imshow(
-            result100, cmap="gray", vmin=vmin, vmax=vmax
+        axes[2].imshow(
+            result100,
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax
         )
-
-        fig.colorbar(im0, ax=axes[0])
-        fig.colorbar(im1, ax=axes[1])
-        fig.colorbar(im2, ax=axes[2])
 
     axes[0].set_title("Original")
     axes[1].set_title("Bokeh, diameter = 50")
@@ -452,26 +338,19 @@ def display_results(original, result50, result100, title):
     plt.show()
 
 
-# ============================================================
-# 9. Main
-# ============================================================
-
 image_paths = [
+    "data/bokeh/marigold.png",
     "data/bokeh/deep.png",
     "data/bokeh/lotus.png",
-    "data/bokeh/marigold.png"
 ]
 
 for path in image_paths:
-
     image = plt.imread(path).astype(np.float64)
 
     if np.max(image) > 1.0:
         image /= 255.0
 
-    print("\n====================================")
-    print("Image:", path)
-    print("====================================")
+    print("\nImage:", path)
 
     foreground_mask = select_foreground(
         image,
@@ -479,9 +358,13 @@ for path in image_paths:
     )
 
     plt.figure(figsize=(8, 6))
-    plt.imshow(foreground_mask, cmap="gray", vmin=0, vmax=1)
+    plt.imshow(
+        foreground_mask,
+        cmap="gray",
+        vmin=0,
+        vmax=1
+    )
     plt.title("Foreground mask")
-    plt.colorbar()
     plt.axis("off")
     plt.show()
 

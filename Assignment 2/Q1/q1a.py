@@ -79,7 +79,7 @@ sigma = 2.0
 
 for path in image_paths:
 
-    img = cv2.imread(path)
+    img = cv2.imread(str(path))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     sharp1 = unsharp_mask(img, sigma=sigma, s=s1)
