@@ -83,7 +83,8 @@ def extract_source_patches(
 
     positions = np.column_stack((ys, xs))
 
-    if len(positions) > max_candidates:
+    # max_candidates=None keeps every valid patch
+    if max_candidates is not None and len(positions) > max_candidates:
         selected = rng.choice(
             len(positions), size=max_candidates, replace=False
         )
@@ -152,13 +153,14 @@ def patch_bounds(y, x, patch_size, height, width):
 
 def grow_texture(
     texture, output_size=256, patch_size=5,
-    max_candidates=200, tolerance=1.1, seed=0
+    max_candidates=None, tolerance=1.1, seed=0
 ):
     """
     Grow a texture outward from the centered input image.
-    At each iteration, a frontier neighborhood is matched against
-    source patches. The selected patch supplies values for unknown
-    pixels in that neighborhood.
+    At each iteration, the unknown pixel whose neighborhood is most
+    complete is chosen, and its neighborhood is matched against source
+    patches. The selected patch supplies values for unknown pixels in
+    that neighborhood.
     """
     rng = np.random.default_rng(seed)
     texture = np.asarray(texture, dtype=np.uint8)
@@ -194,17 +196,23 @@ def grow_texture(
     output[y0:y0 + sh, x0:x0 + sw] = source
     known[y0:y0 + sh, x0:x0 + sw] = True
 
-    kernel = np.ones((3, 3), dtype=np.uint8)
-
     while not np.all(known):
-        unknown = ~known
-        adjacent = cv2.dilate(known.astype(np.uint8), kernel) > 0
-        frontier = np.argwhere(unknown & adjacent)
+        # Grow outwards layer by layer: the pixel with the most known
+        # neighbours goes next (random among ties). A random frontier
+        # order breaks up long structures such as stripes.
+        known_count = cv2.boxFilter(
+            known.astype(np.float32),
+            ddepth=-1,
+            ksize=(patch_size, patch_size),
+            normalize=False,
+            borderType=cv2.BORDER_CONSTANT
+        )
+        scores = np.where(known, -1, known_count)
 
-        if len(frontier) == 0:
+        if scores.max() <= 0:
             raise RuntimeError("Texture growth stopped before filling the output.")
 
-        # Random frontier order avoids always growing in one direction.
+        frontier = np.argwhere(scores == scores.max())
         cy, cx = frontier[rng.integers(len(frontier))]
         py, px = patch_bounds(
             cy, cx, patch_size, height, width
@@ -228,14 +236,17 @@ def grow_texture(
 
 
 def inpaint_texture(
-    image, hole_mask, texture=None, patch_size=5,
-    max_candidates=200, tolerance=1.1, seed=1
+    image, hole_mask, patch_size=7, search_radius=40,
+    tolerance=1.1, seed=1
 ):
     """
     Fill an arbitrary binary hole using texture patch matching.
 
-    If texture is None, patches come from fully known regions of the
-    input image. Pixels outside the hole are preserved exactly.
+    Source patches are all patches lying fully outside the hole within
+    search_radius of the neighbourhood being filled, so that each part of
+    the hole is filled from the texture that surrounds it (and every
+    nearby candidate is compared, not a random subset).
+    Pixels outside the hole are preserved exactly.
     """
     rng = np.random.default_rng(seed)
     image = np.asarray(image, dtype=np.uint8)
@@ -252,14 +263,19 @@ def inpaint_texture(
     if height < patch_size or width < patch_size:
         raise ValueError("Image dimensions must be at least patch_size.")
 
-    source = image if texture is None else np.asarray(texture, dtype=np.uint8)
-    if texture is None:
-        source_valid = ~hole
-    else:
-        source_valid = np.ones(source.shape[:2], dtype=bool)
+    # valid_source[y, x]: patch with top-left (y, x) lies fully outside
+    # the hole (integral image counts the known pixels in every patch)
+    integral = cv2.integral((~hole).astype(np.uint8))
+    p = patch_size
+    known_in_patch = (
+        integral[p:, p:] - integral[:-p, p:]
+        - integral[p:, :-p] + integral[:-p, :-p]
+    )
+    valid_source = known_in_patch == p * p
 
-    candidates, _, _ = extract_source_patches(
-        source, patch_size, max_candidates, rng, source_valid
+    # windows[y, x] is a view of image[y:y + p, x:x + p] (no copy)
+    windows = np.lib.stride_tricks.sliding_window_view(
+        image, (p, p), axis=(0, 1)
     )
     weights = make_weights(patch_size)
 
@@ -298,6 +314,26 @@ def inpaint_texture(
         )
         local_known = known[py:py + patch_size, px:px + patch_size]
 
+        # Every fully known source patch inside the search window
+        # (window grows if it contains none, e.g. deep inside a big hole)
+        radius = search_radius
+        while True:
+            y0, x0 = max(0, py - radius), max(0, px - radius)
+            y1 = min(valid_source.shape[0], py + radius + 1)
+            x1 = min(valid_source.shape[1], px + radius + 1)
+            ys, xs = np.nonzero(valid_source[y0:y1, x0:x1])
+
+            covers_image = (y0, x0) == (0, 0) and (y1, x1) == valid_source.shape
+            if len(ys) > 0 or covers_image:
+                break
+            radius *= 2
+
+        if len(ys) == 0:
+            raise ValueError("No fully known source patch is available.")
+
+        candidates = windows[ys + y0, xs + x0].transpose(0, 2, 3, 1)
+        candidates = candidates.astype(np.float32)
+
         index = choose_patch(
             candidates, target, local_known, weights, rng, tolerance
         )
@@ -311,6 +347,62 @@ def inpaint_texture(
     # Strictly preserve every pixel outside the requested mask.
     output[~hole] = image[~hole]
     return output
+
+
+def make_text_mask_auto(
+    image, white_min=200, white_spread=30, include_pins=True,
+    group_size=15, min_group=150, grow=4, max_island=40
+):
+    """
+    Automatic mask for map labels (white text with a dark outline, and
+    purple location pins), kept tight around the label pixels.
+
+    1) Seeds: near-white unsaturated pixels (letters, pin rim and icon)
+       and, optionally, saturated purple pixels (pin body).
+    2) Seeds are grouped by dilating with a group_size kernel; groups with
+       fewer than min_group seed pixels (isolated bright specks on the
+       rock) are dropped, so only text-like clusters remain.
+    3) The kept seeds are dilated by grow pixels to also cover the dark
+       outline and the anti-aliased edges of the letters.
+    4) Tiny unmasked islands enclosed by the mask (outline pixels inside
+       letters such as 'a', 'e', 'E') are filled.
+    """
+    rgb = np.asarray(image, dtype=np.int16)
+    lowest, highest = rgb.min(axis=2), rgb.max(axis=2)
+
+    seeds = (lowest >= white_min) & (highest - lowest <= white_spread)
+
+    if include_pins:
+        hsv = cv2.cvtColor(np.asarray(image, dtype=np.uint8), cv2.COLOR_RGB2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        seeds |= (hue >= 125) & (hue <= 145) & (sat > 80) & (val > 150)
+
+    groups = cv2.dilate(
+        seeds.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (group_size, group_size))
+    )
+    num_groups, group_id = cv2.connectedComponents(groups)
+
+    seeds_per_group = np.bincount(group_id[seeds], minlength=num_groups)
+    keep = seeds_per_group >= min_group
+    keep[0] = False
+
+    text = seeds & keep[group_id]
+
+    mask = cv2.dilate(
+        text.astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+    )
+
+    # Label 0 = masked pixels; every other component is an unmasked region
+    _, island_id, stats, _ = cv2.connectedComponentsWithStats(
+        (mask == 0).astype(np.uint8), connectivity=4
+    )
+    small = stats[:, cv2.CC_STAT_AREA] < max_island
+    small[0] = False
+    mask[small[island_id]] = 255
+
+    return mask
 
 
 def make_text_mask_interactive(image):
@@ -387,11 +479,20 @@ def make_text_mask_interactive(image):
     return mask
 
 
-def show_pair(left, right, left_title, right_title, save_path):
+def show_pair(left, right, left_title, right_title, save_path, width=12):
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    # Axes widths follow the image widths and the figure is tall enough for
+    # both, so the two images share one pixel scale (a small sample is
+    # shown small next to a larger image)
+    total_width = left.shape[1] + right.shape[1]
+    height = width * max(left.shape[0], right.shape[0]) / total_width + 0.6
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(width, height),
+        gridspec_kw=dict(width_ratios=[left.shape[1], right.shape[1]])
+    )
     axes[0].imshow(left)
     axes[0].set_title(left_title)
     axes[0].axis("off")
@@ -401,7 +502,7 @@ def show_pair(left, right, left_title, right_title, save_path):
     axes[1].axis("off")
 
     plt.tight_layout()
-    fig.savefig(save_path, dpi=160, bbox_inches="tight")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     plt.close(fig)
 
@@ -409,12 +510,15 @@ def show_pair(left, right, left_title, right_title, save_path):
 def main():
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir.parent / "data" / "texture"
+    # Full-resolution images go to outputs_texture, report figures to output
     output_dir = base_dir / "outputs_texture"
     output_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir = base_dir.parent / "output"
+    figure_dir.mkdir(parents=True, exist_ok=True)
 
-    # Tune these parameters after inspecting each output.
-    patch_size = 5
-    max_candidates = 200
+    # Parts (a) and (b), tuned for the three texture samples.
+    patch_size = 13
+    max_candidates = None  # compare against every patch of the sample
     tolerance = 1.1
     random_seed = 0
 
@@ -435,14 +539,22 @@ def main():
         show_pair(
             sample,
             result,
-            f"Input: {name}",
-            "Synthesized 256 x 256",
-            output_dir / f"comparison_{Path(name).stem}.png"
+            f"Sample\n({sample.shape[0]} x {sample.shape[1]})",
+            f"Synthesized from {name} (256 x 256)",
+            figure_dir / f"q3b{i + 1}.png"
         )
 
-    # Parts (c) and (d).
+    # Parts (c) and (d), tuned for lohagad.png.
+    inpaint_patch_size = 7
+    search_radius = 40
+    use_interactive_mask = False  # True: paint the text mask by hand
+
     lohagad = read_image(data_dir / "lohagad.png")
-    text_mask = make_text_mask_interactive(lohagad)
+
+    if use_interactive_mask:
+        text_mask = make_text_mask_interactive(lohagad)
+    else:
+        text_mask = make_text_mask_auto(lohagad)
 
     save_rgb(
         output_dir / "lohagad_hole_mask.png",
@@ -456,9 +568,8 @@ def main():
     filled = inpaint_texture(
         lohagad,
         text_mask,
-        texture=None,
-        patch_size=patch_size,
-        max_candidates=max_candidates,
+        patch_size=inpaint_patch_size,
+        search_radius=search_radius,
         tolerance=tolerance,
         seed=random_seed + 10
     )
@@ -469,7 +580,8 @@ def main():
         filled,
         "Lohagad with text hole",
         "Texture-based inpainting",
-        output_dir / "lohagad_inpainting_comparison.png"
+        figure_dir / "q3d1.png",
+        width=16
     )
 
 if __name__ == "__main__":
